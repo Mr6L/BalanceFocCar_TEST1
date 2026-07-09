@@ -1,75 +1,45 @@
 /*
-  ____        _                         _____
- |  _ \      | |                       / ____|
- | |_) | __ _| | __ _ _ __   ___ ___  | |     __ _ _ __
- |  _ < / _` | |/ _` | '_ \ / __/ _ \ | |    / _` | '__|
- | |_) | (_| | | (_| | | | | (_|  __/ | |___| (_| | |
- |____/ \__,_|_|\__,_|_| |_|\___\___|  \_____\__,_|_|
-   _____           _           _   ____         __     __  _    _                 _     _
-  / ____|         | |         | | |  _ \        \ \   / / | |  | |               | |   | |
- | |     ___  __ _| |_ ___  __| | | |_) |_   _   \ \_/ ___| |__| | __ _ _ __ ___ | | __| |
- | |    / _ \/ _` | __/ _ \/ _` | |  _ <| | | |   \   / _ |  __  |/ _` | '__/ _ \| |/ _` |
- | |___|  __| (_| | ||  __| (_| | | |_) | |_| |    | |  __| |  | | (_| | | | (_) | | (_| |
-  \_____\___|\__,_|\__\___|\__,_| |____/ \__, |    |_|\___|_|  |_|\__,_|_|  \___/|_|\__,_|
-                                          __/ |
-                                         |___/
-
- Copyright (c) 2024 YeHarold
+  Balance controller for ESP32-S3 + MG513P20_12V DC motors + TB6612.
 */
 
 #include "SuperCar.h"
-#include "APP.h"
-#include "ButtonAndBattery.h"
+#include "CarCommands.h"
 #include "UprightPID.h"
 #include "UserConfig.h"
 #include <Arduino.h>
 #include <MPU6050.h>
-#include <SimpleFOC.h>
+#include <esp_sleep.h>
 #include <math.h>
 
-// sensor instance
-MagneticSensorI2C sensor_A = MagneticSensorI2C(AS5600_I2C);
-MagneticSensorI2C sensor_B = MagneticSensorI2C(AS5600_I2C);
-
-TwoWire I2C_A = TwoWire(1);
 TwoWire I2C_B = TwoWire(0);
-
 MPU6050 mpu6050(I2C_B);
 
-// BLDC motor & driver instance
-BLDCMotor motor_A = BLDCMotor(7);
-BLDCMotor motor_B = BLDCMotor(7);
-BLDCDriver3PWM driver_A = BLDCDriver3PWM(MOTOR_A_PWM_U, MOTOR_A_PWM_V, MOTOR_A_PWM_W);
-BLDCDriver3PWM driver_B = BLDCDriver3PWM(MOTOR_B_PWM_U, MOTOR_B_PWM_V, MOTOR_B_PWM_W);
+DcMotor motorA;
+DcMotor motorB;
+QuadratureEncoder encoderA;
+QuadratureEncoder encoderB;
 
-// -----------------------------------------------
-
-#if MONITOR_MODE
-Commander command = Commander(Serial);
-void doMotorA(char *cmd)
-{
-    command.motor(&motor_A, cmd);
-}
-
-void doMotorB(char *cmd)
-{
-    command.motor(&motor_B, cmd);
-}
-#endif
-// -----------------------------------------------
 UprightPID_t upRightPIDConfig;
-// PIDController Velocity_PID{.P = VELOCITY_Kp, .I = VELOCITY_Ki, .D = VELOCITY_Kd, .ramp = 1000, .limit =
-// VELOCITY_LIMIT};
-PIDController Velocity_PID(VELOCITY_Kp, VELOCITY_Ki, VELOCITY_Kd, 1000, VELOCITY_LIMIT);
-bool velocityLoopEnabled = ENABLE_VELOCITY_LOOP;
-float targetAngleOffset = 1.1f;
+float motorPwmLimit = MOTOR_PWM_LIMIT;
+
+PID velocityPid(VELOCITY_Kp, VELOCITY_Ki, VELOCITY_Kd,
+                TARGET_ANGLE_LIMIT, TARGET_ANGLE_LIMIT);
+PID motorVelPidA(MOTOR_VEL_Kp, MOTOR_VEL_Ki, 0.0f,
+                 motorPwmLimit, motorPwmLimit);
+PID motorVelPidB(MOTOR_VEL_Kp, MOTOR_VEL_Ki, 0.0f,
+                 motorPwmLimit, motorPwmLimit);
+
+bool velocityLoopEnabled = ENABLE_VELOCITY_LOOP != 0;
+float targetAngleOffset = 1.0f;
 float targetAngleLimit = TARGET_ANGLE_LIMIT;
 float targetVelocityLimit = TARGET_VEL_LIMIT;
 float velocityFeedbackSign = VELOCITY_FEEDBACK_SIGN;
+float motorVelLpfAlpha = MOTOR_VEL_LPF_ALPHA;
 float directSpeedDampingKp = DIRECT_SPEED_DAMPING_Kp;
 float directSpeedDampingLimit = DIRECT_SPEED_DAMPING_LIMIT;
 float directSpeedDampingDeadband = DIRECT_SPEED_DAMPING_DEADBAND;
 float directSpeedDampingFilterAlpha = DIRECT_SPEED_DAMPING_FILTER_ALPHA;
+
 static bool balanceArmed = false;
 static unsigned long startupReadyAfterMs = 0;
 static unsigned long suspendCandidateSinceMs = 0;
@@ -80,9 +50,16 @@ static bool landingContactNeeded = false;
 static bool landingContactSeen = false;
 static float lastAccNorm = 1.0f;
 static bool motorOutputEnabled = false;
-//------------------------------------------------
 
-static const char *runStateName(uint8_t state)
+static uint32_t lastInnerPidUs = 0;
+static uint32_t lastOuterPidUs = 0;
+
+static float filteredMA_Velocity = 0.0f;
+static float filteredMB_Velocity = 0.0f;
+
+CarControl_t carCTRL;
+
+const char *runStateName(uint8_t state)
 {
     switch (state)
     {
@@ -95,38 +72,6 @@ static const char *runStateName(uint8_t state)
     default:
         return "WAIT_STABLE";
     }
-}
-
-static const char *focDirectionName(Direction direction)
-{
-    switch (direction)
-    {
-    case Direction::CW:
-        return "Direction::CW";
-    case Direction::CCW:
-        return "Direction::CCW";
-    default:
-        return "Direction::UNKNOWN";
-    }
-}
-
-static void printFocCalibration(const char *motorName, BLDCMotor &motor, int initResult)
-{
-    Serial.print("[FOC] ");
-    Serial.print(motorName);
-    Serial.print(" init_result=");
-    Serial.println(initResult);
-
-    Serial.print("#define ");
-    Serial.print(motorName);
-    Serial.print("_SENSOR_DIRECTION ");
-    Serial.println(focDirectionName(motor.sensor_direction));
-
-    Serial.print("#define ");
-    Serial.print(motorName);
-    Serial.print("_ZERO_ELECTRIC_ANGLE ");
-    Serial.print(motor.zero_electric_angle, 6);
-    Serial.println("f");
 }
 
 static void setRunState(uint8_t state)
@@ -149,26 +94,22 @@ static void stopMotorOutput()
     carCTRL.TargetAngle = targetAngleOffset;
     carCTRL.MotorVelocity = 0.0f;
     carCTRL.SpeedDamping = 0.0f;
-    motor_A.target = 0.0f;
-    motor_B.target = 0.0f;
+
     upRightPIDConfig.Ki_Out = 0.0f;
-    Velocity_PID.reset();
-    motor_A.PID_velocity.reset();
-    motor_B.PID_velocity.reset();
+    velocityPid.reset();
+    motorVelPidA.reset();
+    motorVelPidB.reset();
+
+    motorA.brake();
+    motorB.brake();
 }
 
 static void clearDriveControl()
 {
-    appCTRL.Direction = "stop";
-    appCTRL.Velocity = appCTRL.MPUOffset;
-    appCTRL.SteerVelocity = 0.0f;
-    appCTRL.VelocityTarget = appCTRL.MPUOffset;
-    appCTRL.SteerTarget = 0.0f;
-    appCTRL.DriveEnabled = false;
-    appCTRL.TimedDriveEnabled = false;
-    appCTRL.VoiceDriveEnabled = false;
-    appCTRL.DistanceEnabled = false;
-    appCTRL.DistanceDone = false;
+    driveCommand.velocity = 0.0f;
+    driveCommand.steer = 0.0f;
+    driveCommand.enabled = false;
+    driveCommand.timeoutMs = 0;
 }
 
 static void disableMotorOutput()
@@ -179,8 +120,8 @@ static void disableMotorOutput()
         return;
     }
 
-    motor_A.disable();
-    motor_B.disable();
+    motorA.coast();
+    motorB.coast();
     motorOutputEnabled = false;
     Serial.println("Motor output disabled.");
 }
@@ -192,8 +133,6 @@ static void enableMotorOutput()
         return;
     }
 
-    motor_A.enable();
-    motor_B.enable();
     motorOutputEnabled = true;
     stopMotorOutput();
     Serial.println("Motor output enabled.");
@@ -235,139 +174,43 @@ static bool isLandingContactDetected()
 
 void SuperCar::startTask()
 {
-
-    // ---------------------------------------------------------------
-    Serial.begin(115200);
-    // initialise magnetic sensor hardware
-    I2C_A.begin(37, 36, 400000UL);
+    // I2C for MPU6050 only (pins 8/9)
     I2C_B.begin(8, 9, 400000UL);
-    sensor_A.init(&I2C_A);
-    sensor_B.init(&I2C_B);
 
-    // link the motor to the sensor
-    motor_A.linkSensor(&sensor_A);
-    motor_B.linkSensor(&sensor_B);
+    // DC motors: PWM + direction pins, sign aligns forward motion
+    motorA.init(MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, 0, MOTOR_A_BALANCE_SIGN);
+    motorB.init(MOTOR_B_PWM, MOTOR_B_IN1, MOTOR_B_IN2, 1, MOTOR_B_BALANCE_SIGN);
 
-    // driver config
-    // power supply voltage [V]
-    driver_A.voltage_power_supply = 8.2;
-    driver_B.voltage_power_supply = 8.2;
-    driver_A.init();
-    driver_B.init();
-    // link the motor and the driver
-    motor_A.linkDriver(&driver_A);
-    motor_B.linkDriver(&driver_B);
-    // motor config
-    motor_A.foc_modulation = FOCModulationType::SpaceVectorPWM;
-    motor_B.foc_modulation = FOCModulationType::SpaceVectorPWM;
-    // set motion control loop to be used
-    motor_A.torque_controller = TorqueControlType::voltage;
-    motor_B.torque_controller = TorqueControlType::voltage;
-    motor_A.controller = MotionControlType::velocity;
-    motor_B.controller = MotionControlType::velocity;
+    // Quadrature encoders (output-shaft counts)
+    const float countsPerRev = (float)MOTOR_ENCODER_PPR * 4.0f * MOTOR_GEAR_RATIO;
+    encoderA.init(MOTOR_A_ENC_A, MOTOR_A_ENC_B, countsPerRev, MOTOR_A_BALANCE_SIGN);
+    encoderB.init(MOTOR_B_ENC_A, MOTOR_B_ENC_B, countsPerRev, MOTOR_B_BALANCE_SIGN);
 
-    // velocity PI controller parameters
-    motor_A.PID_velocity.P = VEL_Kp;
-    motor_A.PID_velocity.I = VEL_Ki;
-    motor_A.PID_velocity.output_ramp = 1000;
-    motor_A.LPF_velocity.Tf = 0.02f;
-    motor_A.voltage_sensor_align = 0.6f;
-    motor_A.voltage_limit = MOTOR_VOLTAGE_LIMIT;
-
-    motor_B.PID_velocity.P = VEL_Kp;
-    motor_B.PID_velocity.I = VEL_Ki;
-    motor_B.PID_velocity.output_ramp = 1000;
-    motor_B.LPF_velocity.Tf = 0.02f;
-    motor_B.voltage_sensor_align = 0.6f;
-    motor_B.voltage_limit = MOTOR_VOLTAGE_LIMIT;
-
-    // --------------------------------------
-    motor_A.PID_current_q.P = C_Kp;
-    motor_A.PID_current_q.I = C_Ki;
-    motor_A.LPF_current_q.Tf = C_LF;
-    motor_A.PID_current_q.output_ramp = 1000;
-
-    motor_A.PID_current_d.P = C_Kp;
-    motor_A.PID_current_d.I = C_Ki;
-    motor_A.LPF_current_d.Tf = C_LF;
-    motor_A.PID_current_d.output_ramp = 1000;
-
-    motor_A.PID_current_d.limit = 3.0f;
-    motor_A.PID_current_q.limit = 3.0f;
-
-    motor_A.velocity_limit = 100;
-    motor_A.current_limit = 6.0f;
-    // ----------------------------------------
-    motor_B.PID_current_q.P = C_Kp;
-    motor_B.PID_current_q.I = C_Ki;
-    motor_B.LPF_current_q.Tf = C_LF;
-    motor_B.PID_current_q.output_ramp = 1000;
-
-    motor_B.PID_current_d.P = C_Kp;
-    motor_B.PID_current_d.I = C_Ki;
-    motor_B.LPF_current_d.Tf = C_LF;
-    motor_B.PID_current_d.output_ramp = 1000;
-
-    motor_B.PID_current_d.limit = 3.0f;
-    motor_B.PID_current_q.limit = 3.0f;
-
-    motor_B.velocity_limit = 100;
-    motor_B.current_limit = 6.0f;
-
-    // initialize motor
-    motor_A.init();
-    motor_B.init();
-
-    // Keep current sense disabled in the full car firmware. On Arduino-ESP32 2.x
-    // the SimpleFOC MCPWM current-sense ISR can crash during WiFi/NVS flash access.
-
-#if STARTUP_SKIP_FOC_ALIGN
-    motor_A.sensor_direction = MOTOR_A_SENSOR_DIRECTION;
-    motor_A.zero_electric_angle = MOTOR_A_ZERO_ELECTRIC_ANGLE;
-    motor_B.sensor_direction = MOTOR_B_SENSOR_DIRECTION;
-    motor_B.zero_electric_angle = MOTOR_B_ZERO_ELECTRIC_ANGLE;
-#endif
-
-    const int motorAInitResult = motor_A.initFOC();
-    const int motorBInitResult = motor_B.initFOC();
-    motorOutputEnabled = motorAInitResult && motorBInitResult;
-
-    Serial.println("[FOC] Calibration values below are valid only when init_result=1.");
-    printFocCalibration("MOTOR_A", motor_A, motorAInitResult);
-    printFocCalibration("MOTOR_B", motor_B, motorBInitResult);
-
-    // -------------------------------------------------------------------------------------
     UprightPID_Init(&upRightPIDConfig, UPRIGHT_Kp, UPRIGHT_Ki, UPRIGHT_Kd, UPRIGHT_LIMIT);
 
-#if MONITOR_MODE
-    command.add('A', doMotorA, "motorA");
-    command.add('B', doMotorB, "motorB");
-#endif
     mpu6050.begin();
     mpu6050.calcGyroOffsets(false, 500, 0);
+
     disableMotorOutput();
     balanceArmed = false;
     startupReadyAfterMs = millis() + STARTUP_BALANCE_DELAY_MS;
     landingContactNeeded = false;
     landingContactSeen = true;
     setRunState(CAR_STATE_WAIT_STABLE);
-    startPostInitIndicators();
 }
 
-CarControl_t carCTRL;
+static float readFilteredVelocity(QuadratureEncoder &encoder, float &filtered, float alpha)
+{
+    const float raw = encoder.getVelocity();
+    filtered += (raw - filtered) * constrain(alpha, 0.0f, 1.0f);
+    return filtered;
+}
+
 uint8_t velocityCount = 0;
 uint8_t angleCount = 0;
 
 void SuperCar::running()
 {
-    motor_A.loopFOC();
-    motor_B.loopFOC();
-    if (!motorOutputEnabled)
-    {
-        motor_A.move(0.0f);
-        motor_B.move(0.0f);
-    }
-
     mpu6050.update();
     carCTRL.MPUangleX = mpu6050.getAngleX();
     carCTRL.MPUgyroX = mpu6050.getGyroXFV();
@@ -376,10 +219,12 @@ void SuperCar::running()
               mpu6050.getAccZ() * mpu6050.getAccZ());
     carCTRL.MPUaccDelta = fabsf(carCTRL.MPUaccNorm - lastAccNorm);
     lastAccNorm = carCTRL.MPUaccNorm;
-    carCTRL.MA_Velocity = motor_A.shaft_velocity;
-    carCTRL.MB_Velocity = motor_B.shaft_velocity;
-    carCTRL.MA_Angle = motor_A.shaft_angle;
-    carCTRL.MB_Angle = motor_B.shaft_angle;
+
+    carCTRL.MA_Velocity = readFilteredVelocity(encoderA, filteredMA_Velocity, motorVelLpfAlpha);
+    carCTRL.MB_Velocity = readFilteredVelocity(encoderB, filteredMB_Velocity, motorVelLpfAlpha);
+    carCTRL.MA_Angle = encoderA.getAngle();
+    carCTRL.MB_Angle = encoderB.getAngle();
+
     carCTRL.CarVelocity =
         (MOTOR_A_BALANCE_SIGN * carCTRL.MA_Velocity + MOTOR_B_BALANCE_SIGN * carCTRL.MB_Velocity) / 2.0f;
     carCTRL.ForwardVelocity = -velocityFeedbackSign * carCTRL.CarVelocity;
@@ -458,18 +303,44 @@ void SuperCar::running()
         Serial.println("Balance control armed.");
     }
 
-#if MONITOR_MODE
-    motor_A.monitor();
-    motor_B.monitor();
-#endif
-
+    // ---- Outer velocity loop ----
     if (++velocityCount == VEL_PID_UPDATE)
     {
+        const uint32_t nowUs = micros();
+        const float outerDt = (nowUs - lastOuterPidUs) / 1e6f;
+        lastOuterPidUs = nowUs;
+
+        // Drive command timeout check
+        if (driveCommand.enabled && millis() > driveCommand.timeoutMs)
+        {
+            driveCommand.enabled = false;
+            driveCommand.velocity = 0.0f;
+            driveCommand.steer = 0.0f;
+        }
+
+        static float rampedVelocity = 0.0f;
+        static float rampedSteer = 0.0f;
+
+        float requestedVelocity = 0.0f;
+        float requestedSteer = 0.0f;
+        if (driveCommand.enabled)
+        {
+            requestedVelocity = driveCommand.velocity * DRIVE_MAX_VELOCITY;
+            requestedSteer = driveCommand.steer * DRIVE_MAX_STEER;
+        }
+
+        rampedVelocity += constrain(requestedVelocity - rampedVelocity,
+                                    -DRIVE_VEL_RAMP_STEP, DRIVE_VEL_RAMP_STEP);
+        rampedSteer += constrain(requestedSteer - rampedSteer,
+                                 -DRIVE_STEER_RAMP_STEP, DRIVE_STEER_RAMP_STEP);
+
+        carCTRL.TargetVelocity = constrain(rampedVelocity, -targetVelocityLimit, targetVelocityLimit);
+        carCTRL.SteerVelocity = constrain(rampedSteer, -STR_LIMIT, STR_LIMIT);
+
         if (velocityLoopEnabled)
         {
-            carCTRL.TargetVelocity = constrain(appCTRL.Velocity, -targetVelocityLimit, targetVelocityLimit);
             carCTRL.VelocityError = carCTRL.TargetVelocity - carCTRL.ForwardVelocity;
-            const float rawTargetAngle = Velocity_PID(carCTRL.VelocityError) + targetAngleOffset;
+            const float rawTargetAngle = velocityPid.update(carCTRL.VelocityError, outerDt) + targetAngleOffset;
             carCTRL.TargetAngle =
                 constrain(rawTargetAngle, targetAngleOffset - targetAngleLimit, targetAngleOffset + targetAngleLimit);
         }
@@ -481,11 +352,12 @@ void SuperCar::running()
         }
         velocityCount = 0;
     }
+
+    // ---- Upright loop ----
     if (++angleCount == UPRIGHT_PID_UPDATE)
     {
-        carCTRL.SteerVelocity = constrain(appCTRL.SteerVelocity, -STR_LIMIT, STR_LIMIT);
-
         carCTRL.MotorVelocity = UprightPID(&upRightPIDConfig, carCTRL.TargetAngle, carCTRL.MPUangleX, carCTRL.MPUgyroX);
+
 #if DIRECT_SPEED_DAMPING_ENABLE
         const float dampingError = carCTRL.TargetVelocity - carCTRL.ForwardVelocity;
         const float rawSpeedDamping =
@@ -503,10 +375,124 @@ void SuperCar::running()
         angleCount = 0;
     }
 
-    motor_A.target = MOTOR_A_BALANCE_SIGN * carCTRL.MotorVelocity + MOTOR_A_STEER_SIGN * carCTRL.SteerVelocity;
-    motor_B.target = MOTOR_B_BALANCE_SIGN * carCTRL.MotorVelocity + MOTOR_B_STEER_SIGN * carCTRL.SteerVelocity;
-    motor_A.move(motor_A.target);
-    motor_B.move(motor_B.target);
+    // ---- Inner DC motor velocity loop ----
+    const uint32_t nowUs = micros();
+    const float innerDt = (nowUs - lastInnerPidUs) / 1e6f;
+    lastInnerPidUs = nowUs;
+
+    const float leftTarget = MOTOR_A_BALANCE_SIGN * carCTRL.MotorVelocity +
+                             MOTOR_A_STEER_SIGN * carCTRL.SteerVelocity;
+    const float rightTarget = MOTOR_B_BALANCE_SIGN * carCTRL.MotorVelocity +
+                              MOTOR_B_STEER_SIGN * carCTRL.SteerVelocity;
+
+    const float pwmA = motorVelPidA.update(leftTarget - carCTRL.MA_Velocity, innerDt);
+    const float pwmB = motorVelPidB.update(rightTarget - carCTRL.MB_Velocity, innerDt);
+
+    motorA.setSpeed(pwmA);
+    motorB.setSpeed(pwmB);
 }
 
 SuperCar BalanceCar;
+
+// ---------------------------------------------------------------------------
+// Shared drive / status helpers used by BLE and WebControl
+// ---------------------------------------------------------------------------
+
+String setDriveCommand(float throttle, float turn, unsigned long durationMs)
+{
+    throttle = constrain(throttle, -1.0f, 1.0f);
+    turn = constrain(turn, -1.0f, 1.0f);
+
+    driveCommand.velocity = throttle;
+    driveCommand.steer = turn;
+    driveCommand.enabled = true;
+    driveCommand.timeoutMs = millis() + durationMs;
+
+    String json = "{";
+    json += "\"ok\":true";
+    json += ",\"cmd\":\"drive\"";
+    json += ",\"throttle\":" + String(throttle, 3);
+    json += ",\"turn\":" + String(turn, 3);
+    json += ",\"duration_ms\":" + String(durationMs);
+    json += "}";
+    return json;
+}
+
+String stopDriveCommand()
+{
+    clearDriveControl();
+
+    String json = "{";
+    json += "\"ok\":true";
+    json += ",\"cmd\":\"stop\"";
+    json += "}";
+    return json;
+}
+
+String carStatusJson()
+{
+    String json = "{";
+    json += "\"ok\":true";
+    json += ",\"run_state_name\":\"" + String(runStateName(carCTRL.RunState)) + "\"";
+    json += ",\"angle_x\":" + String(carCTRL.MPUangleX, 4);
+    json += ",\"target_angle\":" + String(carCTRL.TargetAngle, 4);
+    json += ",\"target_velocity\":" + String(carCTRL.TargetVelocity, 4);
+    json += ",\"car_velocity\":" + String(carCTRL.ForwardVelocity, 4);
+    json += ",\"velocity_error\":" + String(carCTRL.VelocityError, 4);
+    json += ",\"speed_damping\":" + String(carCTRL.SpeedDamping, 4);
+    json += ",\"ma_velocity\":" + String(carCTRL.MA_Velocity, 4);
+    json += ",\"mb_velocity\":" + String(carCTRL.MB_Velocity, 4);
+
+    // PID parameters for the tuning panel
+    json += ",\"upright_kp\":" + String(upRightPIDConfig.Kp, 4);
+    json += ",\"upright_ki\":" + String(upRightPIDConfig.Ki, 4);
+    json += ",\"upright_kd\":" + String(upRightPIDConfig.Kd, 4);
+    json += ",\"upright_limit\":" + String(upRightPIDConfig.Limit, 4);
+
+    float vkp, vki, vkd;
+    velocityPid.getGains(vkp, vki, vkd);
+    json += ",\"velocity_kp\":" + String(vkp, 4);
+    json += ",\"velocity_ki\":" + String(vki, 4);
+    json += ",\"velocity_kd\":" + String(vkd, 4);
+    json += ",\"velocity_loop\":" + String(velocityLoopEnabled ? 1 : 0);
+
+    float mkpA, mkiA, mkdA;
+    motorVelPidA.getGains(mkpA, mkiA, mkdA);
+    json += ",\"motor_vel_kp\":" + String(mkpA, 4);
+    json += ",\"motor_vel_ki\":" + String(mkiA, 4);
+    json += ",\"motor_lpf\":" + String(motorVelLpfAlpha, 4);
+    json += ",\"voltage_limit\":" + String(MOTOR_PWM_LIMIT, 2);
+
+    json += ",\"target_angle_offset\":" + String(targetAngleOffset, 4);
+    json += ",\"target_angle_limit\":" + String(targetAngleLimit, 4);
+    json += ",\"target_velocity_limit\":" + String(targetVelocityLimit, 4);
+    json += ",\"velocity_feedback_sign\":" + String(velocityFeedbackSign >= 0.0f ? 1 : -1);
+
+    json += ",\"direct_speed_damping_kp\":" + String(directSpeedDampingKp, 4);
+    json += ",\"direct_speed_damping_limit\":" + String(directSpeedDampingLimit, 4);
+    json += ",\"direct_speed_damping_deadband\":" + String(directSpeedDampingDeadband, 4);
+    json += ",\"direct_speed_damping_filter_alpha\":" + String(directSpeedDampingFilterAlpha, 4);
+
+    json += ",\"drive_max_velocity\":" + String(DRIVE_MAX_VELOCITY, 4);
+    json += ",\"drive_max_steer\":" + String(DRIVE_MAX_STEER, 4);
+    json += ",\"drive_vel_ramp_step\":" + String(DRIVE_VEL_RAMP_STEP, 4);
+    json += ",\"drive_brake_ramp_step\":" + String(DRIVE_BRAKE_RAMP_STEP, 4);
+    json += ",\"drive_steer_ramp_step\":" + String(DRIVE_STEER_RAMP_STEP, 4);
+    json += ",\"ble_start_ramp_ms\":" + String(XIAOZHI_BLE_START_RAMP_MS);
+    json += ",\"ble_start_min_scale\":" + String(XIAOZHI_BLE_START_MIN_SCALE, 4);
+
+    json += "}";
+    return json;
+}
+
+// ---------------------------------------------------------------------------
+// Power off stub for boards without a power-latch circuit.
+// Disables motor output and enters deep sleep until reset.
+// ---------------------------------------------------------------------------
+void powerOffCar()
+{
+    Serial.println("Power off requested: disabling motors and entering deep sleep.");
+    disableMotorOutput();
+    delay(200);
+    esp_deep_sleep_start();
+}

@@ -1,7 +1,7 @@
 #include "BluetoothCarControl.h"
 
-#include "APP.h"
-#include "ButtonAndBattery.h"
+#include "CarCommands.h"
+#include "SuperCar.h"
 #include "UserConfig.h"
 
 #include <cstring>
@@ -105,7 +105,7 @@ static void handleCarCommand(const String &action)
 
     if (lower == "status")
     {
-        notifyJsonOk(BalanceCarControlStatusJson());
+        notifyJsonOk(carStatusJson());
         return;
     }
 
@@ -126,36 +126,7 @@ static void handleDriveCommand(const String &body, int cursor)
 
     if (lower == "stop")
     {
-        notifyJsonOk(BalanceCarStopDrive());
-        return;
-    }
-
-    if (lower == "distance")
-    {
-        String metersText;
-        String speedText;
-        if (!nextToken(body, cursor, metersText))
-        {
-            notifyBle("ERR:missing distance meters");
-            return;
-        }
-        const float speed =
-            nextToken(body, cursor, speedText) ? speedText.toFloat() : XIAOZHI_BLE_DEFAULT_MOVE_SPEED_RATIO;
-        notifyJsonOk(BalanceCarMoveDistance(metersText.toFloat(), speed));
-        return;
-    }
-
-    if (lower == "turn")
-    {
-        String degreesText;
-        String speedText;
-        if (!nextToken(body, cursor, degreesText))
-        {
-            notifyBle("ERR:missing turn degrees");
-            return;
-        }
-        const float speed = nextToken(body, cursor, speedText) ? speedText.toFloat() : XIAOZHI_BLE_DEFAULT_TURN_RATIO;
-        notifyJsonOk(BalanceCarTurnInPlace(degreesText.toFloat(), speed));
+        notifyJsonOk(stopDriveCommand());
         return;
     }
 
@@ -171,109 +142,14 @@ static void handleDriveCommand(const String &body, int cursor)
             notifyBle("ERR:manual needs throttle,turn,duration_ms");
             return;
         }
-        notifyJsonOk(BalanceCarDriveFor(
-            throttleText.toFloat(),
-            turnText.toFloat(),
-            (unsigned long)durationText.toInt()));
+        const float throttle = throttleText.toFloat();
+        const float turn = turnText.toFloat();
+        const unsigned long durationMs = (unsigned long)durationText.toInt();
+        notifyJsonOk(setDriveCommand(throttle, turn, durationMs));
         return;
     }
 
     notifyBle("ERR:unknown drive command");
-}
-
-static void handleRgbLightCommand(const String &body, int cursor, bool front)
-{
-    String action;
-    if (!nextToken(body, cursor, action))
-    {
-        notifyJsonOk(front ? BalanceCarSetFrontLight(true, 255, 255, 255) : BalanceCarSetRearLight(true, 255, 0, 0));
-        return;
-    }
-
-    String lower = action;
-    lower.toLowerCase();
-
-    if (lower == "off")
-    {
-        notifyJsonOk(front ? BalanceCarSetFrontLight(false, 0, 0, 0) : BalanceCarSetRearLight(false, 0, 0, 0));
-        return;
-    }
-
-    if (lower == "set")
-    {
-        String rText;
-        String gText;
-        String bText;
-        if (!nextToken(body, cursor, rText) ||
-            !nextToken(body, cursor, gText) ||
-            !nextToken(body, cursor, bText))
-        {
-            notifyBle(front ? "ERR:rgb front set needs r,g,b" : "ERR:rgb rear set needs r,g,b");
-            return;
-        }
-
-        notifyJsonOk(front ? BalanceCarSetFrontLight(true, rText.toInt(), gText.toInt(), bText.toInt())
-                           : BalanceCarSetRearLight(true, rText.toInt(), gText.toInt(), bText.toInt()));
-        return;
-    }
-
-    const bool enable = switchValue(lower, true);
-    notifyJsonOk(front ? BalanceCarSetFrontLight(enable, 255, 255, 255) : BalanceCarSetRearLight(enable, 255, 0, 0));
-}
-
-static void handleRgbCommand(const String &body, int cursor)
-{
-    String action;
-    if (!nextToken(body, cursor, action))
-    {
-        notifyBle("ERR:missing rgb action");
-        return;
-    }
-
-    String lower = action;
-    lower.toLowerCase();
-
-    if (lower == "off")
-    {
-        notifyJsonOk(BalanceCarSetRgb(false, 0, 0, 0));
-        return;
-    }
-
-    if (lower == "status")
-    {
-        notifyJsonOk(BalanceCarControlStatusJson());
-        return;
-    }
-
-    if (lower == "front")
-    {
-        handleRgbLightCommand(body, cursor, true);
-        return;
-    }
-
-    if (lower == "rear" || lower == "back")
-    {
-        handleRgbLightCommand(body, cursor, false);
-        return;
-    }
-
-    if (lower == "set")
-    {
-        String rText;
-        String gText;
-        String bText;
-        if (!nextToken(body, cursor, rText) ||
-            !nextToken(body, cursor, gText) ||
-            !nextToken(body, cursor, bText))
-        {
-            notifyBle("ERR:rgb set needs r,g,b");
-            return;
-        }
-        notifyJsonOk(BalanceCarSetRgb(true, rText.toInt(), gText.toInt(), bText.toInt()));
-        return;
-    }
-
-    notifyBle("ERR:unknown rgb command");
 }
 
 static void handleBlePayload(String payload)
@@ -318,7 +194,8 @@ static void handleBlePayload(String payload)
 
     if (lower == "rgb")
     {
-        handleRgbCommand(body, cursor);
+        // RGB hardware removed; acknowledge but do nothing.
+        notifyJsonOk("{\"ok\":true,\"note\":\"no_rgb\"}");
         return;
     }
 
@@ -391,7 +268,7 @@ static void BluetoothCarControlLoop(void *pvParameters)
             powerOffRequested = false;
             Serial.println("[XiaoZhiBLE] power off requested");
             vTaskDelay(pdMS_TO_TICKS(200));
-            balanceCarPowerOff();
+            powerOffCar();
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
